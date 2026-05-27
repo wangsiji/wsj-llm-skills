@@ -92,9 +92,111 @@ def rewrite_frontmatter(filepath, meta):
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
 
+async def clip_via_weixin(url, ws):
+    """WeChat article: mobile UA + DOM extraction (bypasses CAPTCHA)."""
+    await cdp(ws, "Page.enable")
+    await cdp(ws, "Runtime.enable")
+    await cdp(ws, "Network.enable")
+    
+    # Mobile UA to bypass CAPTCHA
+    await cdp(ws, "Network.setUserAgentOverride", {
+        "userAgent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/125.0.6422.147 Mobile Safari/537.36 "
+                      "MicroMessenger/8.0.50"
+    })
+    await cdp(ws, "Network.clearBrowserCookies")
+    
+    await cdp(ws, "Page.navigate", {"url": url})
+    await wait_load(ws)
+    await asyncio.sleep(5)
+    
+    content = await eval_js(ws, """
+    (function() {
+        var title = (document.querySelector('#activity-name') 
+            || document.querySelector('.rich_media_title') 
+            || document.querySelector('h1') || {}).innerText || document.title;
+        var author = (document.querySelector('#js_name') 
+            || document.querySelector('.rich_media_meta_nickname') || {}).innerText || '';
+        var dateEl = document.querySelector('#publish_time') 
+            || document.querySelector('#js_publish_time') 
+            || document.querySelector('em#publish_time');
+        var pubDate = dateEl ? dateEl.innerText : '';
+        var desc = (document.querySelector('meta[name="description"]') || {}).content || '';
+        
+        var el = document.querySelector('#js_content') 
+            || document.querySelector('.rich_media_content');
+        if (!el) return JSON.stringify({error: 'no content element'});
+        
+        function extract(el, depth) {
+            if (depth > 25 || !el || !el.tagName) return '';
+            var t = el.tagName.toUpperCase();
+            if (['SCRIPT','STYLE','NOSCRIPT','IFRAME','svg'].includes(t)) return '';
+            var r = '';
+            for (var c of el.childNodes) {
+                if (c.nodeType === 3) { var txt = (c.textContent||'').trim(); if (txt) r += txt + ' '; }
+                else if (c.nodeType === 1) {
+                    var ct = c.tagName.toUpperCase();
+                    var tx = extract(c, depth+1);
+                    if (!tx.trim()) continue;
+                    if (['H1','H2','H3','H4','H5','H6'].includes(ct))
+                        r += '\\n' + '#'.repeat(parseInt(ct[1])) + ' ' + tx.trim() + '\\n\\n';
+                    else if (ct === 'LI') r += '- ' + tx.trim() + '\\n';
+                    else if (ct === 'BLOCKQUOTE')
+                        r += '> ' + tx.trim().replace(/\\n/g,'\\n> ') + '\\n\\n';
+                    else if (ct === 'IMG') {
+                        var src = c.getAttribute('data-src') || c.getAttribute('src') || '';
+                        if (src) r += '![' + (c.getAttribute('alt')||'') + '](' + src + ')\\n\\n';
+                    } else if (['B','STRONG'].includes(ct)) r += '**' + tx.trim() + '** ';
+                    else if (['I','EM'].includes(ct)) r += '*' + tx.trim() + '* ';
+                    else r += tx;
+                }
+            }
+            return r;
+        }
+        return JSON.stringify({title: title.trim(), author: author.trim(), 
+            date: pubDate.trim(), description: desc.trim(), content: extract(el, 0)});
+    })()
+    """)
+    
+    if not content: return 1
+    d = json.loads(content) if isinstance(content, str) else content
+    if d.get('error'): print(f"   ❌ {d['error']}"); return 1
+    
+    t = d.get('title', 'Untitled').split('\\n')[0].strip()
+    lines = ['---']
+    lines.append(f'title: "{d.get("title","Untitled")}"')
+    lines.append(f'source: "{url}"')
+    if d.get('author'): lines += ['author:', f'  - "[[{d["author"]}]]"']
+    lines.append(f'created: {datetime.now().strftime("%Y-%m-%d")}')
+    if d.get('date'): lines.append(f'published: {d["date"]}')
+    if d.get('description'):
+        desc = d['description'].replace('"', '\\"')
+        desc_trunc = desc[:200] if len(desc) <= 200 else desc[:197] + '...'
+        lines.append(f'description: "{desc_trunc}"')
+    lines += ['tags:', '  - "clippings"', '---', '', d.get('content','')]
+    
+    fn = re.sub(r'[\\/*?:"<>|]', '-', t[:80]) + '.md'
+    fp = os.path.join(CLIPPING_DIR, fn)
+    c = 1
+    while os.path.exists(fp):
+        fp = os.path.join(CLIPPING_DIR, fn.replace('.md', f'_{c}.md')); c += 1
+    body_content = '\n'.join(lines)
+    with open(fp, 'w', encoding='utf-8') as f: f.write(body_content)
+    print(f"✅ {os.path.basename(fp)} ({len(body_content)} bytes)")
+    return 0
+
 async def clip(url):
+    # Route: WeChat articles use mobile UA + DOM extraction
+    if 'mp.weixin.qq.com' in url:
+        page_ws = await get_ws()
+        if not page_ws:
+            print("❌ No page tab found", file=sys.stderr)
+            return 1
+        async with websockets.connect(page_ws, max_size=20*1024*1024) as ws:
+            return await clip_via_weixin(url, ws)
+
     # ---------------------------------------------------------------
-    # Step 1: Navigate to article via CDP
+    # General path: CDP navigate + Web Clipper + frontmatter rewrite
     # ---------------------------------------------------------------
     page_ws = await get_ws()
     if not page_ws:

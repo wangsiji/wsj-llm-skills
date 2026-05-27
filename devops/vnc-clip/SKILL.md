@@ -17,6 +17,22 @@ triggers:
 
 ## 前置依赖
 
+### 磁盘空间
+
+Syncthing 同步需要至少 1% 磁盘剩余空间写数据库。pip cache 容易积累到 5-10GB，务必定期清理。
+
+已设置 cron job（ID: `b9cc8a6bde74`），每周日 3:00 AM 自动清理 apt/pip/npm cache + journal 日志。
+
+手动触发：
+```bash
+sudo apt-get clean -y                # apt cache
+pip3 cache purge                      # pip cache
+npm cache clean --force               # npm cache
+sudo journalctl --vacuum-time=7d      # journal 日志
+```
+
+### VNC 环境
+
 - Xvfb :2（1920×1080x24）已运行
 - openbox 窗口管理器已运行
 - Chrome with `--remote-debugging-port=9222`（使用非默认 user-data-dir）
@@ -59,16 +75,17 @@ curl -s http://127.0.0.1:9222/json/version | python3 -c "import json,sys; print(
 ```
 
 ## 使用
+## 使用
 
 ```bash
-# 剪藏一条链接
-python3 ~/.hermes/skills/vnc-clip/scripts/clip.py <URL>
+# 剪藏 X 文章
+python3 ~/.hermes/skills/devops/vnc-clip/scripts/clip.py https://x.com/username/status/123456
 
-# 示例
-python3 ~/.hermes/skills/vnc-clip/scripts/clip.py https://x.com/rwayne/status/2059274464622469575
+# 剪藏微信公众号文章（自动使用移动端 UA 绕过 CAPTCHA）
+python3 ~/.hermes/skills/devops/vnc-clip/scripts/clip.py https://mp.weixin.qq.com/s/xxxx
 
 # 普通网页
-python3 ~/.hermes/skills/vnc-clip/scripts/clip.py https://paulgraham.com/greatwork.html
+python3 ~/.hermes/skills/devops/vnc-clip/scripts/clip.py https://paulgraham.com/greatwork.html
 ```
 
 输出文件保存到 Clippings 目录，自动替换 frontmatter 为以下格式：
@@ -78,13 +95,37 @@ python3 ~/.hermes/skills/vnc-clip/scripts/clip.py https://paulgraham.com/greatwo
 title: "文章标题"
 source: "https://..."
 author:
-  - "[[@handle]]"    # X.com 自动从 URL 提取
-published: 2026-05-24  # 如有 meta 信息
-created: 2026-05-27     # 剪藏日期
-description: "..."      # 如有 meta 信息
+  - "[[@handle]]"
+published: 2026-05-24    # 仅当页面有 article:published_time meta 时
+created: 2026-05-27       # 剪藏日期（当天）
+description: "..."        # 仅当页面有 description/og:description meta 时
 tags:
   - "clippings"
 ---
+```
+
+### Frontmatter 字段来源
+
+| 字段 | X.com 来源 | 其他站点来源 | 缺失时行为 |
+|------|-----------|-------------|-----------|
+| `title` | `og:title` → 去 `X 上的` `/ X` 后缀 | `og:title` → `twitter:title` → `document.title` | 必填 |
+| `source` | 传入的 URL | 传入的 URL | 必填 |
+| `author->[[@handle]]` | `twitter:creator` meta → URL handle | 站点相关 meta | 跳过 |
+| `published` | 无（X 推文不提供） | `article:published_time` → `date` meta | 跳过 |
+| `created` | 当天 | 当天 | 必填 |
+| `description` | 无（X 推文不提供） | `description` → `og:description` → `twitter:description` | 跳过 |
+| `tags->clippings` | 固定值 | 固定值 | 必填 |
+
+脚本中对应的 CSS 选择器：
+```javascript
+// title
+meta[property="og:title"] || meta[name="twitter:title"] || document.title
+// author
+meta[name="twitter:creator"] || meta[name="author"]
+// published
+meta[property="article:published_time"] || meta[name="date"]
+// description
+meta[name="description"] || meta[property="og:description"] || meta[name="twitter:description"]
 ```
 
 ## 剪藏后：确保文件同步到手机
@@ -129,6 +170,8 @@ bash ~/.hermes/skills/devops/syncthing-setup/scripts/syncthing-status.sh
 - **openbox**：轻量窗口管理器，让 Xvfb 下的窗口管理正常（之前因缺少 WM 导致 xdotool 无法激活窗口）
 - **快捷键方案放弃原因**：`xdotool` 在 Xvfb 下无法可靠地将键盘事件传递给 Chrome 扩展，而 `chrome.action.openPopup()` 要求用户手势
 
+※ 技术决策历程见 `references/decision-log.md`（为什么不用 xdotool / openPopup / DOM 提取）
+
 ## 文件结构
 
 ```
@@ -147,3 +190,4 @@ bash ~/.hermes/skills/devops/syncthing-setup/scripts/syncthing-status.sh
 | `Could not find an active browser window` | Xvfb 下没有"活跃窗口"概念 | 脚本不使用 `openPopup()`，改用 SW 直接发消息 |
 | 文件没保存到 Clippings 目录 | Web Clipper 配置丢失 | 检查 Chrome 扩展设置中的保存路径 |
 | X.com 内容少或空白 | Cookie 过期 | 刷新 `~/.config/xfetch/session.json` 中的 token |
+| 微信文章跳 CAPTCHA | 桌面端 UA 触发微信反爬 | 脚本自动使用移动端 UA 绕过（`mp.weixin.qq.com` 自动识别） |
